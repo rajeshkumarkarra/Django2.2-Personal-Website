@@ -18,9 +18,13 @@ from django.urls import path
 # . means from the current folder we are importing
 from . import views
 
-urlpatterns = [
+#empty url ('') is for not repeatedly give url ext, so that reguest goes to views.index file directly
 # hello: url extension and views.index means from views.py calling index function
-    path('hello/', views.index),
+urlpatterns = [
+
+    path('', views.index, name='home'),
+    path('contact', views.contact, name='contact'),
+    path('portfolio', views.portfolio, name ='portfolio'),
     
 ]
 
