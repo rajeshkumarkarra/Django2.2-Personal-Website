@@ -11,8 +11,27 @@ def index(request):
 # render is working on index.html file and hide waste stuff and render some results to user
 from django.shortcuts import render
 from .models import Contact
+import requests, json
 def index(request):
-    return render(request, 'mysite/index.html')
+    if request.method == 'POST':
+        firstname=request.POST.get('fname')
+        lastname=request.POST.get('lname')
+        
+        r =requests.get('http://api.icndb.com/jokes/random?firstName'+ firstname + '&lastName=' +lastname)
+        json_data = json.loads(r.text)
+        joke = json_data.get('value').get('joke')
+        context = {'joker': joke}
+        return render(request, 'mysite/index.html', context)
+    else:
+        
+        firstname='rajeshkumar'
+        lastname='kumar'
+        
+        r =requests.get('http://api.icndb.com/jokes/random?firstName'+ firstname + '&lastName=' +lastname)
+        json_data = json.loads(r.text)
+        joke = json_data.get('value').get('joke')
+        context = {'joker': joke}
+        return render(request, 'mysite/index.html', context)
 
 def portfolio(request):
     return render(request, 'mysite/portfolio.html')
