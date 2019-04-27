@@ -2,6 +2,39 @@
 
 
 {% block content %}
-    <p>This is the Home page</p>
+    <div class="container">
+        <div class="row" style="margin-top: 100px">
+           <div class="col-sm-6">
+              <form class="form-inline">
+  <label class="sr-only" for="inlineFormInputName2">First Name</label>
+  <input type="text" class="form-control mb-2 mr-sm-2" id="inlineFormInputName2" placeholder="First Name">
+
+  <label class="sr-only" for="inlineFormInputGroupUsername2">Last Name</label>
+  <input type="text" class="form-control mb-2 mr-sm-2" id="inlineFormInputName2" placeholder="Last Name">
+  
+
+  <button type="submit" class="btn btn-secondary mb-2">Tell me a Chuck Norries joke!</button>
+</form>   
+</div>
+        
+        <div class="col-sm-6">
+            <div class="card" style="width: 40rem;">
+              <div class="card-body">
+                <h5 class="card-title">Chuck Norries</h5>
+                
+                <p class="card-text">rajeshkumar;lastName=karra Norris is the ultimate mutex, all threads fear him.</p>
+                <a href="{% url 'portfolio' %}" class="card-link">Check out my portfolio</a>
+                
+        </div>
+            
+        </div>
+            
+                
+    
+</div>
+      
+        
+        
+    </div>
 {% endblock %}
 
