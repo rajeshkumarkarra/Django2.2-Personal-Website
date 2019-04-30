@@ -3,7 +3,7 @@ and updates outputs"""
 
 # Copyright (c) IPython Development Team.
 # Distributed under the terms of the Modified BSD License.
-
+import base64
 from textwrap import dedent
 from contextlib import contextmanager
 
@@ -12,6 +12,11 @@ try:
 except ImportError:
     from Queue import Empty  # Py 2
 
+try:
+    TimeoutError  # Py 3
+except NameError:
+    TimeoutError = RuntimeError  # Py 2
+
 from traitlets import List, Unicode, Bool, Enum, Any, Type, Dict, Integer, default
 
 from nbformat.v4 import output_from_msg
@@ -19,6 +24,17 @@ from nbformat.v4 import output_from_msg
 from .base import Preprocessor
 from ..utils.exceptions import ConversionException
 
+class DeadKernelError(RuntimeError):
+    pass
+
+class CellExecutionComplete(Exception):
+    """
+    Used as a control signal for cell execution across run_cell and
+    process_message function calls. Raised when all execution requests
+    are completed and no further messages are expected from the kernel
+    over zeromq channels.
+    """
+    pass
 
 class CellExecutionError(ConversionException):
     """
@@ -172,6 +188,15 @@ class ExecutePreprocessor(Preprocessor):
             )
     ).tag(config=True)
 
+    store_widget_state = Bool(True,
+        help=dedent(
+            """
+            If `True` (default), then the state of the Jupyter widgets created
+            at the kernel will be stored in the metadata of the notebook.
+            """
+            )
+    ).tag(config=True)
+
     iopub_timeout = Integer(4, allow_none=False,
         help=dedent(
             """
@@ -292,6 +317,8 @@ class ExecutePreprocessor(Preprocessor):
         self.nb = nb
         # clear display_id map
         self._display_id_map = {}
+        self.widget_state = {}
+        self.widget_buffers = {}
 
         if km is None:
             self.km, self.kc = self.start_new_kernel(cwd=path)
@@ -354,8 +381,26 @@ class ExecutePreprocessor(Preprocessor):
             nb, resources = super(ExecutePreprocessor, self).preprocess(nb, resources)
             info_msg = self._wait_for_reply(self.kc.kernel_info())
             nb.metadata['language_info'] = info_msg['content']['language_info']
+            self.set_widgets_metadata()
 
         return nb, resources
+
+    def set_widgets_metadata(self):
+        if self.widget_state:
+            self.nb.metadata.widgets = {
+                'application/vnd.jupyter.widget-state+json': {
+                    'state': {
+                        model_id: _serialize_widget_state(state)
+                        for model_id, state in self.widget_state.items() if '_model_name' in state
+                    },
+                    'version_major': 2,
+                    'version_minor': 0,
+                }
+            }
+            for key, widget in self.nb.metadata.widgets['application/vnd.jupyter.widget-state+json']['state'].items():
+                buffers = self.widget_buffers.get(key)
+                if buffers:
+                    widget['buffers'] = buffers
 
     def preprocess_cell(self, cell, resources, cell_index):
         """
@@ -367,13 +412,14 @@ class ExecutePreprocessor(Preprocessor):
             return cell, resources
 
         reply, outputs = self.run_cell(cell, cell_index)
+        # Backwards compatability for processes that wrap run_cell
         cell.outputs = outputs
 
         cell_allows_errors = (self.allow_errors or "raises-exception"
                               in cell.metadata.get("tags", []))
 
         if self.force_raise_errors or not cell_allows_errors:
-            for out in outputs:
+            for out in cell.outputs:
                 if out.output_type == 'error':
                     raise CellExecutionError.from_cell_and_msg(cell, out)
             if (reply is not None) and reply['content']['status'] == 'error':
@@ -402,44 +448,50 @@ class ExecutePreprocessor(Preprocessor):
                 outputs[output_idx]['data'] = out['data']
                 outputs[output_idx]['metadata'] = out['metadata']
 
+
+    def _check_alive(self):
+        if not self.kc.is_alive():
+            self.log.error(
+                "Kernel died while waiting for execute reply.")
+            raise DeadKernelError("Kernel died")
+
     def _wait_for_reply(self, msg_id, cell=None):
         # wait for finish, with timeout
+        if self.timeout_func is not None and cell is not None:
+            timeout = self.timeout_func(cell)
+        else:
+            timeout = self.timeout
+
+        if not timeout or timeout < 0:
+            timeout = None
+        cummulative_time = 0
+        timeout_interval = 5
         while True:
             try:
-                if self.timeout_func is not None and cell is not None:
-                    timeout = self.timeout_func(cell)
-                else:
-                    timeout = self.timeout
-
-                if not timeout or timeout < 0:
-                    timeout = None
-                msg = self.kc.shell_channel.get_msg(timeout=timeout)
+                msg = self.kc.shell_channel.get_msg(timeout=timeout_interval)
             except Empty:
-                self.log.error(
-                    "Timeout waiting for execute reply (%is)." % self.timeout)
-                if self.interrupt_on_timeout:
-                    self.log.error("Interrupting kernel")
-                    self.km.interrupt_kernel()
-                    break
-                else:
-                    try:
-                        exception = TimeoutError
-                    except NameError:
-                        exception = RuntimeError
-                    raise exception("Cell execution timed out")
-
-            if msg['parent_header'].get('msg_id') == msg_id:
-                return msg
+                self._check_alive()
+                cummulative_time += timeout_interval
+                if timeout and cummulative_time > timeout:
+                    self.log.error(
+                        "Timeout waiting for execute reply (%is)." % self.timeout)
+                    if self.interrupt_on_timeout:
+                        self.log.error("Interrupting kernel")
+                        self.km.interrupt_kernel()
+                        break
+                    else:
+                        raise TimeoutError("Cell execution timed out")
             else:
-                # not our reply
-                continue
+                if msg['parent_header'].get('msg_id') == msg_id:
+                    return msg
 
     def run_cell(self, cell, cell_index=0):
-        msg_id = self.kc.execute(cell.source)
+        parent_msg_id = self.kc.execute(cell.source)
         self.log.debug("Executing cell:\n%s", cell.source)
-        exec_reply = self._wait_for_reply(msg_id, cell)
+        exec_reply = self._wait_for_reply(parent_msg_id, cell)
 
-        outs = cell.outputs = []
+        cell.outputs = []
+        self.clear_before_next_output = False
 
         while True:
             try:
@@ -455,60 +507,119 @@ class ExecutePreprocessor(Preprocessor):
                     raise RuntimeError("Timeout waiting for IOPub output")
                 else:
                     break
-            if msg['parent_header'].get('msg_id') != msg_id:
+            if msg['parent_header'].get('msg_id') != parent_msg_id:
                 # not an output from our execution
                 continue
 
-            msg_type = msg['msg_type']
-            self.log.debug("output: %s", msg_type)
-            content = msg['content']
-
-            # set the prompt number for the input and the output
-            if 'execution_count' in content:
-                cell['execution_count'] = content['execution_count']
-
-            if msg_type == 'status':
-                if content['execution_state'] == 'idle':
-                    break
-                else:
-                    continue
-            elif msg_type == 'execute_input':
-                continue
-            elif msg_type == 'clear_output':
-                outs[:] = []
-                # clear display_id mapping for this cell
-                for display_id, cell_map in self._display_id_map.items():
-                    if cell_index in cell_map:
-                        cell_map[cell_index] = []
-                continue
-            elif msg_type.startswith('comm'):
-                continue
-
-            display_id = None
-            if msg_type in {'execute_result', 'display_data', 'update_display_data'}:
-                display_id = msg['content'].get('transient', {}).get('display_id', None)
-                if display_id:
-                    self._update_display_id(display_id, msg)
-                if msg_type == 'update_display_data':
-                    # update_display_data doesn't get recorded
-                    continue
-
+            # Will raise CellExecutionComplete when completed
             try:
-                out = output_from_msg(msg)
-            except ValueError:
-                self.log.error("unhandled iopub msg: " + msg_type)
-                continue
-            if display_id:
-                # record output index in:
-                #   _display_id_map[display_id][cell_idx]
-                cell_map = self._display_id_map.setdefault(display_id, {})
-                output_idx_list = cell_map.setdefault(cell_index, [])
-                output_idx_list.append(len(outs))
+                self.process_message(msg, cell, cell_index)
+            except CellExecutionComplete:
+                break
 
-            outs.append(out)
+        # Return cell.outputs still for backwards compatability
+        return exec_reply, cell.outputs
 
-        return exec_reply, outs
+    def process_message(self, msg, cell, cell_index):
+        """
+        Processes a kernel message, updates cell state, and returns the
+        resulting output object that was appended to cell.outputs.
 
+        The input argument `cell` is modified in-place.
+
+        Parameters
+        ----------
+        msg : dict
+            The kernel message being processed.
+        cell : nbformat.NotebookNode
+            The cell which is currently being processed.
+        cell_index : int
+            The position of the cell within the notebook object.
+
+        Returns
+        -------
+        output : dict
+            The execution output payload (or None for no output).
+
+        Raises
+        ------
+        CellExecutionComplete
+          Once a message arrives which indicates computation completeness.
+
+        """
+        msg_type = msg['msg_type']
+        self.log.debug("msg_type: %s", msg_type)
+        content = msg['content']
+        self.log.debug("content: %s", content)
+
+        display_id = content.get('transient', {}).get('display_id', None)
+        if display_id and msg_type in {'execute_result', 'display_data', 'update_display_data'}:
+            self._update_display_id(display_id, msg)
+
+        # set the prompt number for the input and the output
+        if 'execution_count' in content:
+            cell['execution_count'] = content['execution_count']
+
+        if msg_type == 'status':
+            if content['execution_state'] == 'idle':
+                raise CellExecutionComplete()
+        elif msg_type == 'clear_output':
+            self.clear_output(cell.outputs, msg, cell_index)
+        elif msg_type.startswith('comm'):
+            self.handle_comm_msg(cell.outputs, msg, cell_index)
+        # Check for remaining messages we don't process
+        elif msg_type not in ['execute_input', 'update_display_data']:
+            # Assign output as our processed "result"
+            return self.output(cell.outputs, msg, display_id, cell_index)
+
+    def output(self, outs, msg, display_id, cell_index):
+        msg_type = msg['msg_type']
+
+        try:
+            out = output_from_msg(msg)
+        except ValueError:
+            self.log.error("unhandled iopub msg: " + msg_type)
+            return
+
+        if self.clear_before_next_output:
+            self.log.debug('Executing delayed clear_output')
+            outs[:] = []
+            self.clear_display_id_mapping(cell_index)
+            self.clear_before_next_output = False
+
+        if display_id:
+            # record output index in:
+            #   _display_id_map[display_id][cell_idx]
+            cell_map = self._display_id_map.setdefault(display_id, {})
+            output_idx_list = cell_map.setdefault(cell_index, [])
+            output_idx_list.append(len(outs))
+
+        outs.append(out)
+
+        return out
+
+    def clear_output(self, outs, msg, cell_index):
+        content = msg['content']
+        if content.get('wait'):
+            self.log.debug('Wait to clear output')
+            self.clear_before_next_output = True
+        else:
+            self.log.debug('Immediate clear output')
+            outs[:] = []
+            self.clear_display_id_mapping(cell_index)
+
+    def clear_display_id_mapping(self, cell_index):
+        for display_id, cell_map in self._display_id_map.items():
+            if cell_index in cell_map:
+                cell_map[cell_index] = []
+
+    def handle_comm_msg(self, outs, msg, cell_index):
+        content = msg['content']
+        data = content['data']
+        if self.store_widget_state and 'state' in data:  # ignore custom msg'es
+            self.widget_state.setdefault(content['comm_id'], {}).update(data['state'])
+            if 'buffer_paths' in data and data['buffer_paths']:
+                self.widget_buffers[content['comm_id']] = _get_buffer_data(msg)
 
 def executenb(nb, cwd=None, km=None, **kwargs):
     """Execute a notebook's code, updating outputs within the notebook object.
@@ -532,3 +643,26 @@ def executenb(nb, cwd=None, km=None, **kwargs):
         resources['metadata'] = {'path': cwd}
     ep = ExecutePreprocessor(**kwargs)
     return ep.preprocess(nb, resources, km=km)[0]
+
+
+def _serialize_widget_state(state):
+    """Serialize a widget state, following format in @jupyter-widgets/schema."""
+    return {
+        'model_name': state.get('_model_name'),
+        'model_module': state.get('_model_module'),
+        'model_module_version': state.get('_model_module_version'),
+        'state': state,
+    }
+
+
+def _get_buffer_data(msg):
+    encoded_buffers = []
+    paths = msg['content']['data']['buffer_paths']
+    buffers = msg['buffers']
+    for path, buffer in zip(paths, buffers):
+        encoded_buffers.append({
+            'data': base64.b64encode(buffer).decode('utf-8'),
+            'encoding': 'base64',
+            'path': path
+        })
+    return encoded_buffers
