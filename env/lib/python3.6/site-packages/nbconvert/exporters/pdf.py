@@ -8,7 +8,7 @@ import os
 import sys
 
 from ipython_genutils.py3compat import which, cast_bytes_py2, getcwd
-from traitlets import Integer, List, Bool, Instance, Unicode
+from traitlets import Integer, List, Bool, Instance, Unicode, default
 from testpath.tempdir import TemporaryWorkingDirectory
 from .latex import LatexExporter
 
@@ -50,7 +50,7 @@ class PDFExporter(LatexExporter):
         help="How many times latex will be called."
     ).tag(config=True)
 
-    latex_command = List([u"xelatex", u"{filename}"],
+    latex_command = List([u"xelatex", u"{filename}", "-quiet"],
         help="Shell command used to compile latex."
     ).tag(config=True)
 
@@ -64,8 +64,14 @@ class PDFExporter(LatexExporter):
 
     texinputs = Unicode(help="texinputs dir. A notebook's directory is added")
     writer = Instance("nbconvert.writers.FilesWriter", args=(), kw={'build_directory': '.'})
+
+    output_mimetype = "application/pdf"
     
     _captured_output = List()
+
+    @default('file_extension')
+    def _file_extension_default(self):
+        return '.pdf'
 
     def run_command(self, command_list, filename, count, log_function):
         """Run command_list count times.
@@ -166,6 +172,7 @@ class PDFExporter(LatexExporter):
         self._captured_outputs = []
         with TemporaryWorkingDirectory():
             notebook_name = 'notebook'
+            resources['output_extension'] = '.tex'
             tex_file = self.writer.write(latex, resources, notebook_name=notebook_name)
             self.log.info("Building PDF")
             rc = self.run_latex(tex_file)
